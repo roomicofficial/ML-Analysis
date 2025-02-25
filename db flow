@@ -1,0 +1,192 @@
+graph TD;
+
+    %% Aggregated Feature Tables
+    A2["user_aggregated_features Table
+    --------------------------------
+    - user_id (STRING)
+    - agg_reference_date (DATE)
+    - txn_count_30d (INT)
+    - avg_txn_amount_30d (FLOAT)
+    - standin_success_rate_90d (FLOAT)
+    - dispute_rate_90d (FLOAT)
+    - account_age_days (INT)
+    - last_update_ts (DATETIME)"]
+
+    %% Raw Transactions Table
+    A1["transactions_raw Table
+    --------------------------------
+    - transaction_id (STRING)
+    - user_id (STRING)
+    - card_id (STRING)
+    - txn_amount (FLOAT)
+    - txn_timestamp (DATETIME)
+    - is_standin (BOOLEAN)
+    - standin_outcome (STRING)
+    - dispute_flag (BOOLEAN)"]
+    
+    A3["card_aggregated_features Table
+    --------------------------------
+    - card_id (STRING)
+    - agg_reference_date (DATE)
+    - card_txn_count_30d (INT)
+    - card_avg_txn_amount_30d (FLOAT)
+    - card_standin_success_90d (FLOAT)
+    - card_age_days (INT)
+    - last_update_ts (DATETIME)"]
+
+    %% Training Data Tables
+    subgraph "Training Data Creation"
+        B1["user_model_training_data Table
+        --------------------------------
+        - transaction_id (STRING)
+        - user_id (STRING)
+        - event_timestamp (DATETIME)
+        - txn_count_30d (INT)
+        - avg_txn_amount_30d (FLOAT)
+        - standin_success_rate_90d (FLOAT)
+        - dispute_rate_90d (FLOAT)
+        - account_age_days (INT)
+        - txn_amount (FLOAT)
+        - label (INT: 0/1)"]
+        
+        B2["card_model_training_data Table
+        --------------------------------
+        - transaction_id (STRING)
+        - card_id (STRING)
+        - event_timestamp (DATETIME)
+        - card_txn_count_30d (INT)
+        - card_avg_txn_amount_30d (FLOAT)
+        - card_standin_success_90d (FLOAT)
+        - card_age_days (INT)
+        - txn_amount (FLOAT)
+        - label (INT: 0/1)"]
+    end
+
+    %% Model Training
+    subgraph "ML Model Training"
+        C1["Train User Model (XGBoost, Logistic Regression, etc.)"]
+        C2["Train Card Model (XGBoost, Logistic Regression, etc.)"]
+    end
+
+    %% Data Flow Connections
+    A1 -->|Join on user_id, filter standin transactions| B1
+    A1 -->|Join on card_id, filter standin transactions| B2
+
+    A2 -->|Join on user_id, add aggregated features| B1
+    A3 -->|Join on card_id, add aggregated features| B2
+
+    B1 --> C1
+    B2 --> C2
+
+
+**The `user_aggregated_features` and `card_aggregated_features` tables must be regularly updated to include new transaction data.**  
+
+### **Why Do We Need Separate `transactions_raw` and `user_aggregated_features` Tables?**
+1. **Raw Transactions (`transactions_raw`) store individual transactions.**  
+   - Each transaction is a separate row with details like `txn_amount`, `txn_timestamp`, `standin_outcome`, etc.
+   - This table is **high-volume** and constantly growing.
+
+2. **Aggregated Features (`user_aggregated_features`) store precomputed summaries.**  
+   - Instead of calculating metrics like `txn_count_30d` on-the-fly, we periodically update this table.
+   - This makes real-time inference much faster.
+   - The table contains **one row per user** for a given aggregation date.
+
+### **How Aggregated Features Stay Up-to-Date**
+Yes, the aggregated features must **incorporate new transactions**; otherwise, they will become outdated.  
+To ensure freshness, we run **periodic batch jobs** to **recompute aggregated features** using the latest `transactions_raw` data.
+
+---
+
+## **The Data Update Flow**
+### **1. Raw Transactions Are Continuously Collected**
+- Every transaction (`transactions_raw`) is stored in real-time.
+- These include **StandIn and non-StandIn transactions**.
+
+### **2. Periodic Job Updates Aggregated Features**
+- A batch job (e.g., **daily or hourly**) processes recent transactions and **updates `user_aggregated_features`**.  
+- The same happens for **`card_aggregated_features`**.
+
+---
+
+## **Example: How We Update `user_aggregated_features`**
+Let's say **User U001** made **5 new transactions in the last 30 days**.  
+- The **previous `txn_count_30d` was 20** (from the last update).  
+- The batch job runs today and sees **5 new transactions** in `transactions_raw`.  
+- It updates **`txn_count_30d = 25`** in `user_aggregated_features`.  
+
+### **SQL Query to Update `user_aggregated_features`**
+```sql
+INSERT INTO user_aggregated_features (user_id, agg_reference_date, txn_count_30d, avg_txn_amount_30d, standin_success_rate_90d, dispute_rate_90d, account_age_days, last_update_ts)
+SELECT 
+    user_id,
+    CURRENT_DATE AS agg_reference_date,
+    COUNT(*) AS txn_count_30d,
+    AVG(txn_amount) AS avg_txn_amount_30d,
+    SUM(CASE WHEN is_standin = TRUE AND standin_outcome = 'RECOVERED' THEN 1 ELSE 0 END) * 1.0 / 
+    NULLIF(SUM(CASE WHEN is_standin = TRUE THEN 1 ELSE 0 END), 0) AS standin_success_rate_90d,
+    SUM(CASE WHEN dispute_flag = TRUE THEN 1 ELSE 0 END) * 1.0 / COUNT(*) AS dispute_rate_90d,
+    DATEDIFF(CURRENT_DATE, MIN(txn_timestamp)) AS account_age_days,
+    CURRENT_TIMESTAMP AS last_update_ts
+FROM transactions_raw
+WHERE txn_timestamp >= DATE_SUB(CURRENT_DATE, INTERVAL 90 DAY)
+GROUP BY user_id;
+```
+
+### **How It Works**
+✅ **Counts transactions in the last 30 days (`txn_count_30d`)**  
+✅ **Calculates average transaction amount (`avg_txn_amount_30d`)**  
+✅ **Recomputes StandIn success rate over 90 days (`standin_success_rate_90d`)**  
+✅ **Updates dispute rate and account age**  
+
+---
+
+## **3. User Model Training Uses Updated Aggregates**
+After the batch job runs, when we create **`user_model_training_data`**, we always **join it with the latest `user_aggregated_features`**.
+
+🔹 **Why is this necessary?**  
+- If we don’t update the aggregates, **our ML model will learn from outdated user behavior**.  
+- A user’s risk score should reflect their **latest activity**, not what they did months ago.  
+
+---
+
+## **4. The Same Process Applies for `card_aggregated_features`**
+- A separate batch job **updates card-level features** using new transactions.
+- This ensures that `card_txn_count_30d`, `card_avg_txn_amount_30d`, and `card_standin_success_90d` **reflect recent activity**.
+
+### **SQL Query to Update `card_aggregated_features`**
+```sql
+INSERT INTO card_aggregated_features (card_id, agg_reference_date, card_txn_count_30d, card_avg_txn_amount_30d, card_standin_success_90d, card_age_days, last_update_ts)
+SELECT 
+    card_id,
+    CURRENT_DATE AS agg_reference_date,
+    COUNT(*) AS card_txn_count_30d,
+    AVG(txn_amount) AS card_avg_txn_amount_30d,
+    SUM(CASE WHEN is_standin = TRUE AND standin_outcome = 'RECOVERED' THEN 1 ELSE 0 END) * 1.0 /
+    NULLIF(SUM(CASE WHEN is_standin = TRUE THEN 1 ELSE 0 END), 0) AS card_standin_success_90d,
+    DATEDIFF(CURRENT_DATE, MIN(txn_timestamp)) AS card_age_days,
+    CURRENT_TIMESTAMP AS last_update_ts
+FROM transactions_raw
+WHERE txn_timestamp >= DATE_SUB(CURRENT_DATE, INTERVAL 90 DAY)
+GROUP BY card_id;
+```
+
+🔹 **Ensures `card_model_training_data` gets fresh features before training!**
+
+---
+
+## **Summary**
+| Table | Purpose | How It’s Updated |
+|--------|---------|-----------------|
+| `transactions_raw` | Stores **all** raw transactions. | Real-time ingestion. |
+| `user_aggregated_features` | Stores **precomputed user stats** (e.g., 30-day transaction count). | **Updated daily/hourly** using latest `transactions_raw` data. |
+| `card_aggregated_features` | Stores **precomputed card stats**. | **Updated daily/hourly** using latest `transactions_raw` data. |
+| `user_model_training_data` | Stores labeled user training data (user features + StandIn outcomes). | Created **after joining latest `user_aggregated_features`**. |
+| `card_model_training_data` | Stores labeled card training data (card features + StandIn outcomes). | Created **after joining latest `card_aggregated_features`**. |
+
+### **Key Takeaways**
+✅ **`transactions_raw` contains granular data, but real-time inference can’t scan it efficiently.**  
+✅ **We precompute user/card-level aggregates to speed up ML inference.**  
+✅ **Aggregated tables must be periodically updated to reflect new transactions.**  
+✅ **ML training always joins with the latest aggregates to avoid outdated learning.**  
+
+--
