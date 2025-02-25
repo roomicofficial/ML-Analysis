@@ -1,0 +1,43 @@
+graph TD;
+    subgraph Data_Ingestion["Data Ingestion"]
+        A1["Raw Transactions (transactions_raw)"]
+    end
+
+    subgraph Feature_Aggregation["Feature Aggregation"]
+        B1["Aggregate User Features (user_aggregated_features)"]
+        B2["Aggregate Card Features (card_aggregated_features)"]
+    end
+
+    subgraph Model_Training["Model Training"]
+        C1["User Model Training (user_model_training_data)"]
+        C2["Card Model Training (card_model_training_data)"]
+    end
+
+    subgraph Batch_Scoring["Batch Scoring"]
+        D1["User Profile Scores (user_profile_scores)"]
+        D2["Card Profile Scores (card_profile_scores)"]
+    end
+
+    subgraph Real_Time_Inference["Real-Time StandIn Decision"]
+        E1["Fetch Scores (K-V Lookup)"]
+        E2["Meta-Model/Rule Combination"]
+        E3["Final Decision (Approve/Decline)"]
+    end
+
+    ExternalService["External Service: standindecisionserv"]
+
+    %% Pipeline Connections
+    A1 --> B1
+    A1 --> B2
+    B1 --> C1
+    B2 --> C2
+    C1 --> D1
+    C2 --> D2
+    D1 --> E1
+    D2 --> E1
+    E1 --> E2
+    E2 --> E3
+
+    %% External Service Method Call & Reply
+    ExternalService -- "Method Call" --> E3
+    E3 -- "Reply" --> ExternalService
