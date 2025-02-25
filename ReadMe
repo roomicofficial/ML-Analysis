@@ -1,0 +1,238 @@
+Below is a **combined technical document** showing **two separate models** (one for user profiling, one for card profiling) to generate risk scores for real-time StandIn approvals. Instead of Mermaid diagrams, the architecture and data flows are described in **tables**.
+
+---
+
+# Combined User & Card Profiling ML Models
+
+## 1. High-Level Architecture (Tabular Overview)
+
+| **Step** | **Description**                                                                                                                                             | **Inputs**                                      | **Outputs**                                             |
+|----------|-------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------|---------------------------------------------------------|
+| 1. **Raw Transactions** | The system ingests all user/card transactions—both normal and StandIn—into a data warehouse or operational DB.                                                                   | Transaction logs from payment events.          | A large table of raw transaction records.              |
+| 2. **Aggregate User Data** | A periodic job computes user-level summary metrics (e.g., transaction counts, averages, success rates) for each user over specified time windows (e.g., 30/90 days).         | Raw transaction data + user info.             | A user-level features table (one row/user/time window).|
+| 3. **Aggregate Card Data** | Similarly, a job computes card-level summary metrics (e.g., usage counts, success rates) for each card over the same time windows.                                             | Raw transaction data + card info.             | A card-level features table (one row/card/time window).|
+| 4. **User Training Data** | We join user aggregated features with historical StandIn outcomes (recovered vs. lost) to build a labeled dataset for training the user model.                                | User aggregates + transaction outcomes.        | `USER_MODEL_TRAINING_DATA` table (label = 0/1).        |
+| 5. **Card Training Data** | Similarly, we join card aggregated features with historical StandIn outcomes to build a labeled dataset for the card model.                                                    | Card aggregates + transaction outcomes.        | `CARD_MODEL_TRAINING_DATA` table (label = 0/1).        |
+| 6. **Train User Model**  | Train a supervised ML model (e.g., XGBoost) to learn a mapping: user features → probability of successful recovery.                                                             | `USER_MODEL_TRAINING_DATA`.                     | A trained user profiling model artifact.               |
+| 7. **Train Card Model**  | Train another supervised model for card features: card features → probability of successful recovery.                                                                           | `CARD_MODEL_TRAINING_DATA`.                     | A trained card profiling model artifact.               |
+| 8. **Periodic Scoring (User)** | Offline batch scoring applies the user model to each user’s latest aggregated features, producing a “user_risk_score”.                                                      | User aggregated features, user model.          | Writes results to `USER_PROFILE_SCORES`.               |
+| 9. **Periodic Scoring (Card)** | Similarly, batch scoring applies the card model to each card’s latest aggregated features, producing a “card_risk_score”.                                                  | Card aggregated features, card model.          | Writes results to `CARD_PROFILE_SCORES`.               |
+| 10. **Real-Time Inference** | During StandIn, the system fetches `(user_risk_score, card_risk_score, txn_amount, etc.)`, combines them (via a small meta-model or rule) to decide on approval/decline. | K-V lookups from score tables, minimal new inputs. | Final decision = Approve/Decline (or Review).            |
+
+---
+
+## 2. Entity & Table Descriptions
+
+Below are **six primary tables** in this design. The first four support training; the last two store precomputed risk scores for inference.
+
+### 2.1 Raw Transactions Table
+
+| **Table**: `transactions_raw` | **Purpose**: Stores all payment transactions (both StandIn and normal).                                                                                                            |
+|--------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Column Name**         | **Type**    | **Description**                                                                                               |
+| `transaction_id`        | STRING      | Unique identifier for each transaction.                                                                       |
+| `user_id`               | STRING      | The user involved in the transaction.                                                                         |
+| `card_id`               | STRING      | The card used for the transaction (tokenized).                                                                |
+| `txn_amount`            | FLOAT       | Monetary amount of the transaction.                                                                            |
+| `txn_timestamp`         | DATETIME    | When the transaction occurred.                                                                                 |
+| `is_standin`            | BOOLEAN     | TRUE if it was during StandIn mode, FALSE otherwise.                                                           |
+| `standin_outcome`       | STRING      | If `is_standin=TRUE`, this might be “RECOVERED” or “BONUS_LOSS”. Null/empty otherwise.                         |
+| `dispute_flag`          | BOOLEAN     | Indicates whether the transaction later ended in a dispute/chargeback.                                         |
+| `other_fields...`       | ...         | Additional columns, e.g., merchant info, device fingerprint, geolocation, etc.                                 |
+
+### 2.2 User Aggregated Features Table
+
+| **Table**: `user_aggregated_features` | **Purpose**: Summarizes a user’s recent transaction behavior (offline job) for use in both training and batch scoring.                                                |
+|---------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Column Name**              | **Type**   | **Description**                                                                                                   |
+| `user_id`                    | STRING     | User identifier.                                                                                                   |
+| `agg_reference_date`         | DATE       | The date/time these features represent (e.g., daily snapshot).                                                      |
+| `txn_count_30d`              | INT        | Number of transactions (any type) by this user in the last 30 days.                                                 |
+| `avg_txn_amount_30d`         | FLOAT      | Average transaction amount for the user in the last 30 days.                                                        |
+| `standin_success_rate_90d`   | FLOAT      | Fraction of StandIn transactions that were recovered in the last 90 days.                                           |
+| `dispute_rate_90d`           | FLOAT      | Fraction of transactions that ended in disputes in the last 90 days.                                               |
+| `account_age_days`           | INT        | Number of days since the user account was created.                                                                  |
+| `feature_x, feature_y...`    | ...        | Additional user-level aggregated metrics as needed.                                                                 |
+| `last_update_ts`             | DATETIME   | When this row was last updated.                                                                                    |
+
+### 2.3 Card Aggregated Features Table
+
+| **Table**: `card_aggregated_features` | **Purpose**: Summarizes a card’s recent usage across all users (offline job) for use in both training and batch scoring.                                                   |
+|---------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Column Name**              | **Type**   | **Description**                                                                                                     |
+| `card_id`                    | STRING     | Card identifier (tokenized).                                                                                         |
+| `agg_reference_date`         | DATE       | The date/time these features represent (e.g., daily snapshot).                                                        |
+| `card_txn_count_30d`         | INT        | Number of transactions on this card in the last 30 days (across possibly multiple users).                             |
+| `card_avg_txn_amount_30d`    | FLOAT      | Average transaction amount for this card in the last 30 days.                                                         |
+| `card_standin_success_90d`   | FLOAT      | Fraction of StandIn transactions recovered for this card over the last 90 days.                                      |
+| `card_age_days`              | INT        | Number of days since the card was first registered or encountered in the system.                                      |
+| `card_feature_x...`          | ...        | Additional card-level metrics.                                                                                       |
+| `last_update_ts`             | DATETIME   | Timestamp of the last update.                                                                                       |
+
+### 2.4 User Model Training Data Table
+
+| **Table**: `user_model_training_data` | **Purpose**: Each row is one historical StandIn transaction with user-level aggregated features (as of that transaction time) and a final outcome label.             |
+|---------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Column Name**              | **Type**   | **Description**                                                                                                                        |
+| `transaction_id`             | STRING     | ID from `transactions_raw`.                                                                                                           |
+| `user_id`                    | STRING     | User involved in the StandIn transaction.                                                                                             |
+| `event_timestamp`            | DATETIME   | When the StandIn transaction occurred.                                                                                                 |
+| `txn_count_30d`              | INT        | Copied from `user_aggregated_features` relevant to that timestamp.                                                                    |
+| `avg_txn_amount_30d`         | FLOAT      | Copied from `user_aggregated_features`.                                                                                                |
+| `standin_success_rate_90d`   | FLOAT      | Copied from `user_aggregated_features`.                                                                                                |
+| `dispute_rate_90d`           | FLOAT      | Copied from `user_aggregated_features`.                                                                                                |
+| `account_age_days`           | INT        | Copied from `user_aggregated_features`.                                                                                                |
+| `txn_amount`                 | FLOAT      | Specific transaction amount for that StandIn.                                                                                          |
+| `label`                      | INT (0/1)  | 1 = “RECOVERED”, 0 = “BONUS_LOSS”.                                                                                                     |
+| `other_feature_cols...`      | ...        | Any additional aggregated or transaction-level fields.                                                                                 |
+
+### 2.5 Card Model Training Data Table
+
+| **Table**: `card_model_training_data` | **Purpose**: Similar to above, but from a card-centric viewpoint. Each row is a historical StandIn transaction with card-level aggregated features and a final outcome label. |
+|---------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Column Name**              | **Type**   | **Description**                                                                                                                            |
+| `transaction_id`             | STRING     | ID from `transactions_raw`.                                                                                                               |
+| `card_id`                    | STRING     | Card used in the StandIn transaction.                                                                                                      |
+| `event_timestamp`            | DATETIME   | When the StandIn transaction occurred.                                                                                                     |
+| `card_txn_count_30d`         | INT        | Copied from `card_aggregated_features` relevant to that timestamp.                                                                         |
+| `card_avg_txn_amount_30d`    | FLOAT      | Copied from `card_aggregated_features`.                                                                                                    |
+| `card_standin_success_90d`   | FLOAT      | Copied from `card_aggregated_features`.                                                                                                    |
+| `card_age_days`              | INT        | Copied from `card_aggregated_features`.                                                                                                    |
+| `txn_amount`                 | FLOAT      | Specific StandIn transaction amount.                                                                                                       |
+| `label`                      | INT (0/1)  | 1 = “RECOVERED”, 0 = “BONUS_LOSS”.                                                                                                         |
+| `other_feature_cols...`      | ...        | Any additional card-level or transaction-level fields.                                                                                     |
+
+### 2.6 User & Card Profile Scores Tables (for Real-Time)
+
+When training is done, we periodically score all users/cards offline. The results go into two separate tables (or a key-value store).
+
+**User Profile Scores**  
+| **Table**: `user_profile_scores` | **Purpose**: Stores the latest user-level risk score (probability of successful StandIn recovery). |
+|----------------------------------|--------------------------------------------------------------------------------------------------|
+| `user_id`          | STRING    | User identifier.                                                                |
+| `user_risk_score`  | FLOAT     | Probability in \([0,1]\); higher means more likely to recover.                  |
+| `model_version`    | STRING    | Which model version generated this score (for auditing).                        |
+| `score_timestamp`  | DATETIME  | When this row was updated.                                                      |
+
+**Card Profile Scores**  
+| **Table**: `card_profile_scores` | **Purpose**: Stores the latest card-level risk score (probability of successful StandIn recovery). |
+|----------------------------------|--------------------------------------------------------------------------------------------------|
+| `card_id`          | STRING    | Card identifier.                                                                 |
+| `card_risk_score`  | FLOAT     | Probability in \([0,1]\); higher means more likely to recover.                   |
+| `model_version`    | STRING    | Which model version generated this score (for auditing).                         |
+| `score_timestamp`  | DATETIME  | When this row was updated.                                                       |
+
+---
+
+## 3. Training: Inputs & Outputs
+
+### 3.1 User Model Training
+
+- **Input**: Rows from `user_model_training_data`.  
+  - Each row has user features (e.g., `txn_count_30d`, `avg_txn_amount_30d`, etc.) plus a binary outcome `label` (1 = recovered, 0 = lost).
+- **Process**: Train a classifier (e.g., XGBoost, LightGBM, or logistic regression) to map user features → probability( recovery ).
+- **Output**: A trained model artifact (saved with a version identifier, e.g., `user_model_v1`).
+
+### 3.2 Card Model Training
+
+- **Input**: Rows from `card_model_training_data`.  
+  - Each row has card features (e.g., `card_txn_count_30d`, `card_avg_txn_amount_30d`, etc.) plus a binary outcome label (1 or 0).
+- **Process**: Train a classifier to map card features → probability( recovery ).
+- **Output**: A trained model artifact (e.g., `card_model_v1`).
+
+---
+
+## 4. Inference: Offline Scoring & Real-Time Usage
+
+### 4.1 Offline (Batch) Scoring
+
+After training is complete, we apply each model to the **latest aggregated features** for each user/card.
+
+1. **User Scoring**  
+   1. Take each row in `user_aggregated_features` (for the day/hour).  
+   2. Pass it through the **User Profiling Model**.  
+   3. Get a single numeric probability → `user_risk_score`.  
+   4. Store `(user_id, user_risk_score, model_version, score_timestamp)` in `user_profile_scores`.
+
+2. **Card Scoring**  
+   1. Similarly, for each row in `card_aggregated_features`, pass it through the **Card Profiling Model**.  
+   2. Output `card_risk_score`, store in `card_profile_scores`.
+
+### 4.2 Real-Time StandIn Decision
+
+When a StandIn transaction occurs:
+
+1. **Inputs**: 
+   - `(user_id, card_id, txn_amount, possibly device info, etc.)`.
+2. **Lookup Scores**:
+   - `SELECT user_risk_score FROM user_profile_scores WHERE user_id = ?`.
+   - `SELECT card_risk_score FROM card_profile_scores WHERE card_id = ?`.
+3. **Combine**:
+   - Possibly via a formula: 
+     \[
+       \text{final\_score} = w_1 \times \text{user\_risk\_score} \;+\; w_2 \times \text{card\_risk\_score} \;+\; w_3 \times \text{log}(1 + \text{txn\_amount})
+     \]
+   - Or use a **meta-model** that takes `(user_risk_score, card_risk_score, txn_amount)` and outputs a final probability.
+4. **Decision**:
+   - If `final_score ≥ threshold`, **approve**. Otherwise, **decline** or route to manual review.
+5. **Log**:
+   - Optionally store `(transaction_id, user_risk_score, card_risk_score, final_decision)` in an inference log table for auditing.
+
+---
+
+## 5. Example Snapshots
+
+### 5.1 User Model Training Data
+
+| transaction_id | user_id | event_timestamp      | txn_count_30d | avg_txn_amount_30d | standin_success_rate_90d | dispute_rate_90d | account_age_days | txn_amount | label |
+|---------------:|--------:|---------------------:|--------------:|-------------------:|-------------------------:|-----------------:|-----------------:|-----------:|------:|
+| T101           | U001    | 2024-12-15 10:05:00  | 20           | 40.2              | 0.95                    | 0.05            | 200             | 55.0       | 1     |
+| T102           | U002    | 2024-12-18 14:30:00  | 1            | 150.0             | 0.00                    | 0.00            | 30              | 150.0      | 0     |
+| T103           | U001    | 2024-12-20 11:20:00  | 21           | 42.0              | 0.95                    | 0.04            | 205             | 60.0       | 1     |
+| ...           | ...     | ...                  | ...          | ...               | ...                     | ...             | ...             | ...        | ...   |
+
+### 5.2 Card Model Training Data
+
+| transaction_id | card_id | event_timestamp      | card_txn_count_30d | card_avg_txn_amount_30d | card_standin_success_90d | card_age_days | txn_amount | label |
+|---------------:|--------:|---------------------:|-------------------:|-------------------------:|-------------------------:|-------------:|----------:|------:|
+| T101           | C4567   | 2024-12-15 10:05:00  | 55                | 75.0                    | 0.90                    | 200          | 55.0      | 1     |
+| T102           | C9898   | 2024-12-18 14:30:00  | 5                 | 300.0                   | 0.50                    | 20           | 150.0     | 0     |
+| T103           | C4567   | 2024-12-20 11:20:00  | 57                | 73.0                    | 0.92                    | 202          | 60.0      | 1     |
+| ...           | ...     | ...                  | ...               | ...                     | ...                     | ...          | ...       | ...   |
+
+### 5.3 User Profile Scores Table (After Batch Scoring)
+
+| user_id | user_risk_score | model_version      | score_timestamp        |
+|--------:|----------------:|--------------------|------------------------|
+| U001    | 0.90            | user_model_v1      | 2025-02-25 06:00:00    |
+| U002    | 0.30            | user_model_v1      | 2025-02-25 06:00:00    |
+| U003    | 0.70            | user_model_v1      | 2025-02-25 06:00:00    |
+
+### 5.4 Card Profile Scores Table (After Batch Scoring)
+
+| card_id | card_risk_score | model_version      | score_timestamp        |
+|--------:|----------------:|--------------------|------------------------|
+| C4567   | 0.88            | card_model_v1      | 2025-02-25 06:00:00    |
+| C9898   | 0.35            | card_model_v1      | 2025-02-25 06:00:00    |
+| C1234   | 0.75            | card_model_v1      | 2025-02-25 06:00:00    |
+
+---
+
+## 6. Summary
+
+1. **Two Separate ML Models**:
+   - A **User Model** that focuses on user-centric features (dispute rates, success rates, transaction velocity).  
+   - A **Card Model** that focuses on card-centric features (usage frequency, average amounts, success rates).
+
+2. **Training**:
+   - Each model is trained on historical StandIn transactions (label: recovered or lost).  
+   - We build two labeled datasets: `USER_MODEL_TRAINING_DATA` and `CARD_MODEL_TRAINING_DATA`.  
+
+3. **Batch Aggregation & Scoring**:
+   - Instead of querying thousands of transactions in real time, we periodically compute aggregated features for each user/card.  
+   - We apply the trained models offline to generate a single “risk score” per user or card.  
+
+4. **Real-Time Inference**:
+   - During StandIn, we quickly fetch `(user_risk_score, card_risk_score, transaction amount)`, combine them, and decide on approval or decline in milliseconds.  
+
+This architecture balances the **predictive power** of ML with the **operational speed** required for high-volume payment systems. You get specialized risk assessments at both the **user** and **card** level, then combine those insights to minimize losses and optimize approvals.
