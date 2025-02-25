@@ -1,0 +1,18 @@
+graph TD;
+
+    C1["standindecisionserv"]
+
+    subgraph  
+        A1["Incoming StandIn Transaction"]
+        A2["Fetch user_risk_score"]
+        A3["Fetch card_risk_score"]
+        B1["Combine and Validate Scores with Threshold"]
+    end
+
+
+    A1 --> A2
+    A1 --> A3
+    A2 --> B1
+    A3 --> B1
+    B1 --> |Recovery Score| C1
+    C1 --> |Realtime Request| A1
